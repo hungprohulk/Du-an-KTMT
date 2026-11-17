@@ -1,0 +1,270 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import minimalmodbus
+import serial
+import time
+import threading
+
+# --- CẤU HÌNH MODBUS BUS ---
+PORT = "COM4"           # Cổng USB-RS485 của bạn
+BAUDRATE = 9600
+
+ID_SENSOR = 1           # XY-MD02 (FC04)
+ID_RELAY  = 255         # Bo Relay 4 kênh (FC05)
+
+COIL_FAN  = 0           # Kênh 1: Quạt 12V (Làm mát)
+COIL_MIST = 1           # Kênh 2: Phun sương 5V (Tạo ẩm qua LM2596)
+COIL_PTC  = 2           # Kênh 3: Thanh sấy PTC 12V (Sưởi ấm)
+
+# --- CẤU HÌNH MODBUS INSTRUMENTS ---
+try:
+    sensor = minimalmodbus.Instrument(PORT, ID_SENSOR)
+    sensor.serial.baudrate = BAUDRATE
+    sensor.serial.bytesize = 8
+    sensor.serial.parity   = serial.PARITY_NONE
+    sensor.serial.stopbits = 1
+    sensor.serial.timeout  = 0.4
+    sensor.mode            = minimalmodbus.MODE_RTU
+    sensor.clear_buffers_before_each_transaction = True
+
+    relay = minimalmodbus.Instrument(PORT, ID_RELAY)
+    relay.serial = sensor.serial
+    relay.mode   = minimalmodbus.MODE_RTU
+    relay.clear_buffers_before_each_transaction = True
+except Exception as e:
+    print(f"Lỗi khởi tạo cổng COM: {e}")
+
+# Biến toàn cục trạng thái
+current_temp = 0.0
+current_humi = 0.0
+auto_mode = True
+
+states = {
+    "fan": False,
+    "mist": False,
+    "ptc": False
+}
+
+def write_relay(coil, target_state, dev_name):
+    """Gửi lệnh Modbus FC05 điều khiển Relay, xử lý ngoại lệ NoResponseError"""
+    time.sleep(0.05)
+    try:
+        relay.write_bit(coil, 1 if target_state else 0, functioncode=5)
+        states[dev_name] = target_state
+    except minimalmodbus.NoResponseError:
+        states[dev_name] = target_state
+    except Exception as e:
+        print(f"Lỗi điều khiển {dev_name}: {e}")
+
+# --- GIAO DIỆN HMI TKINTER ---
+root = tk.Tk()
+root.title("HỆ THỐNG GIÁM SÁT & ĐIỀU KHIỂN VI KHÍ HẬU MODBUS RTU")
+root.geometry("640x630")
+root.configure(bg="#f0f2f5")
+
+# Style
+style = ttk.Style()
+style.theme_use('clam')
+
+# Title Header
+lbl_title = tk.Label(root, text="HMI CHUẨN MODBUS RTU - RS485 MASTER", font=("Helvetica", 14, "bold"), bg="#1e293b", fg="white", pady=10)
+lbl_title.pack(fill="x")
+
+# Frame Hiển Thị Thông Số
+frame_readings = ttk.Frame(root, relief="groove", padding=10)
+frame_readings.pack(fill="x", padx=15, pady=10)
+
+lbl_temp_title = tk.Label(frame_readings, text="NHIỆT ĐỘ", font=("Helvetica", 12, "bold"), fg="#dc2626")
+lbl_temp_title.grid(row=0, column=0, padx=40, pady=5)
+
+lbl_humi_title = tk.Label(frame_readings, text="ĐỘ ẨM", font=("Helvetica", 12, "bold"), fg="#2563eb")
+lbl_humi_title.grid(row=0, column=1, padx=40, pady=5)
+
+lbl_temp_val = tk.Label(frame_readings, text="--.- °C", font=("Helvetica", 28, "bold"), fg="#dc2626")
+lbl_temp_val.grid(row=1, column=0, padx=40, pady=5)
+
+lbl_humi_val = tk.Label(frame_readings, text="--.- %", font=("Helvetica", 28, "bold"), fg="#2563eb")
+lbl_humi_val.grid(row=1, column=1, padx=40, pady=5)
+
+# Frame Ngưỡng Điều Khiển (Hysteresis)
+frame_set = tk.LabelFrame(root, text=" CÀI ĐẶT NGƯỠNG ĐIỀU KHIỂN (AUTO) ", font=("Helvetica", 10, "bold"), bg="#ffffff", fg="#334155", padx=10, pady=10)
+frame_set.pack(fill="x", padx=15, pady=5)
+
+# Entry variables
+ent_t_on_var   = tk.StringVar(value="30.8")   # Quạt bật khi nóng
+ent_t_off_var  = tk.StringVar(value="30.4")   # Quạt tắt khi hạ nhiệt
+ent_h_on_var   = tk.StringVar(value="65.0")   # Phun sương bật khi khô
+ent_h_off_var  = tk.StringVar(value="72.0")   # Phun sương tắt khi đủ ẩm
+ent_ptc_on_var = tk.StringVar(value="29.0")   # PTC bật khi lạnh
+ent_ptc_off_var= tk.StringVar(value="30.0")   # PTC tắt khi ấm
+
+# Hàng 1: Cài đặt Quạt
+tk.Label(frame_set, text="Quạt Bật khi T ≥ (°C):", bg="#ffffff").grid(row=0, column=0, sticky="e", pady=2)
+tk.Entry(frame_set, textvariable=ent_t_on_var, width=6).grid(row=0, column=1, pady=2, padx=5)
+
+tk.Label(frame_set, text="Quạt Tắt khi T ≤ (°C):", bg="#ffffff").grid(row=0, column=2, sticky="e", pady=2)
+tk.Entry(frame_set, textvariable=ent_t_off_var, width=6).grid(row=0, column=3, pady=2, padx=5)
+
+# Hàng 2: Cài đặt Phun sương
+tk.Label(frame_set, text="Sương Bật khi H ≤ (%):", bg="#ffffff").grid(row=1, column=0, sticky="e", pady=2)
+tk.Entry(frame_set, textvariable=ent_h_on_var, width=6).grid(row=1, column=1, pady=2, padx=5)
+
+tk.Label(frame_set, text="Sương Tắt khi H ≥ (%):", bg="#ffffff").grid(row=1, column=2, sticky="e", pady=2)
+tk.Entry(frame_set, textvariable=ent_h_off_var, width=6).grid(row=1, column=3, pady=2, padx=5)
+
+# Hàng 3: Cài đặt Sấy PTC
+tk.Label(frame_set, text="PTC Bật khi T ≤ (°C):", bg="#ffffff").grid(row=2, column=0, sticky="e", pady=2)
+tk.Entry(frame_set, textvariable=ent_ptc_on_var, width=6).grid(row=2, column=1, pady=2, padx=5)
+
+tk.Label(frame_set, text="PTC Tắt khi T ≥ (°C):", bg="#ffffff").grid(row=2, column=2, sticky="e", pady=2)
+tk.Entry(frame_set, textvariable=ent_ptc_off_var, width=6).grid(row=2, column=3, pady=2, padx=5)
+
+# Frame Trạng Thái & Bằng Tay (Manual)
+frame_ctrl = tk.LabelFrame(root, text=" TRẠNG THÁI & ĐIỀU KHIỂN TẢI ", font=("Helvetica", 10, "bold"), bg="#ffffff", fg="#334155", padx=10, pady=10)
+frame_ctrl.pack(fill="x", padx=15, pady=10)
+
+# Toggle Auto / Manual
+btn_mode = tk.Button(frame_ctrl, text="CHẾ ĐỘ: TỰ ĐỘNG (AUTO)", font=("Helvetica", 11, "bold"), bg="#16a34a", fg="white", width=30)
+btn_mode.grid(row=0, column=0, columnspan=3, pady=8)
+
+# Đèn chỉ báo & Nút manual
+lbl_status_fan  = tk.Label(frame_ctrl, text="QUẠT (K1): OFF", font=("Helvetica", 10, "bold"), bg="#e2e8f0", fg="#475569", width=16, height=2)
+lbl_status_fan.grid(row=1, column=0, padx=5, pady=5)
+
+lbl_status_mist = tk.Label(frame_ctrl, text="SƯƠNG (K2): OFF", font=("Helvetica", 10, "bold"), bg="#e2e8f0", fg="#475569", width=16, height=2)
+lbl_status_mist.grid(row=1, column=1, padx=5, pady=5)
+
+lbl_status_ptc  = tk.Label(frame_ctrl, text="SẤY PTC (K3): OFF", font=("Helvetica", 10, "bold"), bg="#e2e8f0", fg="#475569", width=16, height=2)
+lbl_status_ptc.grid(row=1, column=2, padx=5, pady=5)
+
+btn_toggle_fan  = tk.Button(frame_ctrl, text="Bật/Tắt Quạt", state="disabled")
+btn_toggle_fan.grid(row=2, column=0, pady=2)
+
+btn_toggle_mist = tk.Button(frame_ctrl, text="Bật/Tắt Sương", state="disabled")
+btn_toggle_mist.grid(row=2, column=1, pady=2)
+
+btn_toggle_ptc  = tk.Button(frame_ctrl, text="Bật/Tắt PTC", state="disabled")
+btn_toggle_ptc.grid(row=2, column=2, pady=2)
+
+def toggle_mode():
+    global auto_mode
+    auto_mode = not auto_mode
+    if auto_mode:
+        btn_mode.config(text="CHẾ ĐỘ: TỰ ĐỘNG (AUTO)", bg="#16a34a")
+        btn_toggle_fan.config(state="disabled")
+        btn_toggle_mist.config(state="disabled")
+        btn_toggle_ptc.config(state="disabled")
+    else:
+        btn_mode.config(text="CHẾ ĐỘ: BẰNG TAY (MANUAL)", bg="#ea580c")
+        btn_toggle_fan.config(state="normal")
+        btn_toggle_mist.config(state="normal")
+        btn_toggle_ptc.config(state="normal")
+
+btn_mode.config(command=toggle_mode)
+
+def manual_fan():
+    if not auto_mode:
+        write_relay(COIL_FAN, not states["fan"], "fan")
+
+def manual_mist():
+    if not auto_mode:
+        write_relay(COIL_MIST, not states["mist"], "mist")
+
+def manual_ptc():
+    if not auto_mode:
+        write_relay(COIL_PTC, not states["ptc"], "ptc")
+
+btn_toggle_fan.config(command=manual_fan)
+btn_toggle_mist.config(command=manual_mist)
+btn_toggle_ptc.config(command=manual_ptc)
+
+# Log Bar Footer
+lbl_log = tk.Label(root, text="Hệ thống đã kết nối USB-RS485 COM4", font=("Consolas", 9), bg="#cbd5e1", anchor="w", padx=10)
+lbl_log.pack(fill="x", side="bottom")
+
+# --- LUỒNG ĐỌC SENSOR & LOGIC AUTO ---
+def update_ui():
+    lbl_temp_val.config(text=f"{current_temp:.1f} °C")
+    lbl_humi_val.config(text=f"{current_humi:.1f} %")
+
+    if states["fan"]:
+        lbl_status_fan.config(text="QUẠT (K1): ON", bg="#22c55e", fg="white")
+    else:
+        lbl_status_fan.config(text="QUẠT (K1): OFF", bg="#e2e8f0", fg="#475569")
+
+    if states["mist"]:
+        lbl_status_mist.config(text="SƯƠNG (K2): ON", bg="#0284c7", fg="white")
+    else:
+        lbl_status_mist.config(text="SƯƠNG (K2): OFF", bg="#e2e8f0", fg="#475569")
+
+    if states["ptc"]:
+        lbl_status_ptc.config(text="SẤY PTC (K3): ON", bg="#ef4444", fg="white")
+    else:
+        lbl_status_ptc.config(text="SẤY PTC (K3): OFF", bg="#e2e8f0", fg="#475569")
+
+    root.after(500, update_ui)
+
+def modbus_thread_loop():
+    global current_temp, current_humi
+    
+    # Đồng bộ tắt hết tải ban đầu
+    write_relay(COIL_FAN, False, "fan")
+    write_relay(COIL_MIST, False, "mist")
+    write_relay(COIL_PTC, False, "ptc")
+
+    while True:
+        try:
+            time.sleep(0.05)
+            # 1. Đọc cảm biến XY-MD02 (FC04, thanh ghi 1-2)
+            regs = sensor.read_registers(registeraddress=1, number_of_registers=2, functioncode=4)
+            
+            raw_t = regs[0]
+            if raw_t > 32767:
+                raw_t -= 65536
+            current_temp = raw_t / 10.0
+            current_humi = regs[1] / 10.0
+
+            # 2. Thuật toán AUTO Hysteresis cho cả 3 tải
+            if auto_mode:
+                try:
+                    t_on    = float(ent_t_on_var.get())
+                    t_off   = float(ent_t_off_var.get())
+                    h_on    = float(ent_h_on_var.get())
+                    h_off   = float(ent_h_off_var.get())
+                    ptc_on  = float(ent_ptc_on_var.get())
+                    ptc_off = float(ent_ptc_off_var.get())
+
+                    # a. Điều khiển QUẠT (K1 - Làm mát)
+                    if not states["fan"] and current_temp >= t_on:
+                        write_relay(COIL_FAN, True, "fan")
+                    elif states["fan"] and current_temp <= t_off:
+                        write_relay(COIL_FAN, False, "fan")
+
+                    # b. Điều khiển PHUN SƯƠNG (K2 - Tạo ẩm)
+                    if not states["mist"] and current_humi <= h_on:
+                        write_relay(COIL_MIST, True, "mist")
+                    elif states["mist"] and current_humi >= h_off:
+                        write_relay(COIL_MIST, False, "mist")
+
+                    # c. Điều khiển SẤY PTC (K3 - Sưởi ấm)
+                    if not states["ptc"] and current_temp <= ptc_on:
+                        write_relay(COIL_PTC, True, "ptc")
+                    elif states["ptc"] and current_temp >= ptc_off:
+                        write_relay(COIL_PTC, False, "ptc")
+
+                except ValueError:
+                    pass
+
+        except minimalmodbus.NoResponseError:
+            print("Cảnh báo: Timeout đọc cảm biến!")
+        except Exception as e:
+            print(f"Lỗi đọc Modbus: {e}")
+
+        time.sleep(1.2)
+
+# Khởi tạo luồng ngầm
+t = threading.Thread(target=modbus_thread_loop, daemon=True)
+t.start()
+
+root.after(500, update_ui)
+root.mainloop()
